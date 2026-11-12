@@ -21,7 +21,7 @@ sliced89 = sliced86:WaitForChild("Packages"):WaitForChild("Net")
 -- XV RIDDLER — direct OpenAI mode (proxy was dead, HTTP 404)
 -- KEY LOADER: fetches from your private pastebin raw URL at runtime
 do
-    local _keyUrl = "PASTE_YOUR_PASTEBIN_RAW_URL_HERE"
+    local _keyUrl = "https://pastebin.com/raw/hbHkTKVB"
     local _ok, _res = pcall(function()
         return game:HttpGet(_keyUrl, true)
     end)
