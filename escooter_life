@@ -1,0 +1,723 @@
+-- ================================================================
+--   XV • ESCOOTER LIFE  v3
+--   by XV Tools
+-- ================================================================
+--  FEATURES
+--  ─────────────────────────────────────────────────────────────
+--  • Auto Wheelie   – smooth, direction-locked, angle slider
+--  • Auto Farm      – coin/cash/gem collect, NO movement, mobile-safe
+--  • Speed Boost    – 3 speed tiers (Fast / Turbo / Sonic)
+--  • Infinite Boost – keeps boost meter full every tick
+--  • No Clip        – phase through walls
+--  • Anti-AFK       – silent jiggle loop
+--  • Fly            – free-fly with WASD / joystick
+--  • Minimize       – collapse to title bar tap
+--  ─────────────────────────────────────────────────────────────
+
+-- ================================================================
+-- SERVICES
+-- ================================================================
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+local LP         = Players.LocalPlayer
+local PGui       = LP:WaitForChild("PlayerGui")
+
+local function getChar()  return LP.Character end
+local function getRoot()  return getChar() and getChar():FindFirstChild("HumanoidRootPart") end
+local function getHum()   return getChar() and getChar():FindFirstChildOfClass("Humanoid") end
+
+-- ================================================================
+-- STATE
+-- ================================================================
+local S = {
+    wheelie       = false,
+    farm          = false,
+    speed         = false,
+    speedTier     = 1,          -- 1=Fast(60) 2=Turbo(120) 3=Sonic(220)
+    infiniteBoost = false,
+    noClip        = false,
+    fly           = false,
+    antiAfk       = true,
+    wheelieAngle  = 50,         -- degrees
+}
+
+local SPEED_TIERS   = {60, 120, 220}
+local SPEED_LABELS  = {"Fast", "Turbo", "Sonic"}
+local connections   = {}
+local flyBodyVel    = nil
+local flyBodyGyro   = nil
+local collectDone   = {}
+local collectTimer  = 0
+
+-- ================================================================
+-- WHEELIE
+-- ================================================================
+
+-- finds the scooter seat/vehicle the player is sitting on
+local function getVehicleSeat()
+    local char = getChar(); if not char then return nil end
+    local hum  = getHum();  if not hum  then return nil end
+    -- SeatPart is set when humanoid is seated
+    if hum.SeatPart and hum.SeatPart:IsA("VehicleSeat") then
+        return hum.SeatPart
+    end
+    -- fallback: scan workspace for VehicleSeat the player occupies
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("VehicleSeat") then
+            if obj.Occupant == hum then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+local function startWheelie()
+    if connections.wheelie then connections.wheelie:Disconnect() end
+    connections.wheelie = RunService.Heartbeat:Connect(function()
+        pcall(function()
+            -- prefer the vehicle seat — that's what actually tilts the scooter
+            local seat = getVehicleSeat()
+            if seat then
+                local _, yaw, _ = seat.CFrame:ToEulerAnglesYXZ()
+                seat.CFrame = CFrame.new(seat.Position)
+                    * CFrame.fromEulerAnglesYXZ(math.rad(-S.wheelieAngle), yaw, 0)
+                return
+            end
+            -- fallback: tilt HRP directly (on foot)
+            local root = getRoot(); if not root then return end
+            local _, yaw, _ = root.CFrame:ToEulerAnglesYXZ()
+            root.CFrame = CFrame.new(root.Position)
+                * CFrame.fromEulerAnglesYXZ(math.rad(-S.wheelieAngle), yaw, 0)
+        end)
+    end)
+end
+
+local function stopWheelie()
+    if connections.wheelie then
+        connections.wheelie:Disconnect()
+        connections.wheelie = nil
+    end
+    -- restore vehicle seat upright
+    pcall(function()
+        local seat = getVehicleSeat()
+        if seat then
+            local _, yaw, _ = seat.CFrame:ToEulerAnglesYXZ()
+            seat.CFrame = CFrame.new(seat.Position) * CFrame.fromEulerAnglesYXZ(0, yaw, 0)
+            return
+        end
+        local root = getRoot(); if not root then return end
+        local _, yaw, _ = root.CFrame:ToEulerAnglesYXZ()
+        root.CFrame = CFrame.new(root.Position) * CFrame.fromEulerAnglesYXZ(0, yaw, 0)
+    end)
+end
+
+-- ================================================================
+-- FARM
+-- ================================================================
+local KEYWORDS = {
+    "coin","cash","money","xp","gem","token","reward",
+    "star","pickup","collectible","note","bill","drop"
+}
+
+local function nameHit(n)
+    n = n:lower()
+    for _, k in ipairs(KEYWORDS) do
+        if n:find(k) then return true end
+    end
+    return false
+end
+
+local function doCollect()
+    local root = getRoot(); if not root then return end
+    local now  = tick()
+    if now - collectTimer < 2.5 then return end
+    collectTimer = now
+    collectDone  = {}
+
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if nameHit(obj.Name) then
+            local part = obj:IsA("BasePart") and obj
+                or obj:FindFirstChildWhichIsA("BasePart")
+            if part then
+                local dist = (part.Position - root.Position).Magnitude
+                if dist < 80 then
+                    local id = part:GetDebugId()
+                    if not collectDone[id] then
+                        collectDone[id] = true
+                        pcall(function()
+                            local cd = part:FindFirstChildOfClass("ClickDetector")
+                                or obj:FindFirstChildOfClass("ClickDetector")
+                            if cd then fireclickdetector(cd) end
+                        end)
+                        pcall(function()
+                            local pp = part:FindFirstChildOfClass("ProximityPrompt")
+                                or obj:FindFirstChildOfClass("ProximityPrompt")
+                            if pp then fireproximityprompt(pp) end
+                        end)
+                        -- touch collect
+                        if part:FindFirstChildOfClass("TouchTransmitter") then
+                            local orig = root.CFrame
+                            root.CFrame = part.CFrame + Vector3.new(0,3,0)
+                            task.delay(0.05, function()
+                                pcall(function() root.CFrame = orig end)
+                            end)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function startFarm()
+    if connections.farm then connections.farm:Disconnect() end
+    connections.farm = RunService.Heartbeat:Connect(function()
+        if S.farm then pcall(doCollect) end
+    end)
+end
+
+-- ================================================================
+-- SPEED
+-- ================================================================
+local function applySpeed()
+    pcall(function()
+        local hum = getHum(); if not hum then return end
+        hum.WalkSpeed = S.speed and SPEED_TIERS[S.speedTier] or 16
+        hum.JumpPower = S.speed and 80 or 50
+    end)
+end
+LP.CharacterAdded:Connect(function() task.delay(1, applySpeed) end)
+
+-- ================================================================
+-- INFINITE BOOST — fills any "Boost" / "Energy" value each tick
+-- ================================================================
+local function startInfiniteBoost()
+    if connections.boost then connections.boost:Disconnect() end
+    connections.boost = RunService.Heartbeat:Connect(function()
+        if not S.infiniteBoost then return end
+        pcall(function()
+            local char = getChar(); if not char then return end
+            for _, v in ipairs(char:GetDescendants()) do
+                if v:IsA("NumberValue") or v:IsA("IntValue") then
+                    local n = v.Name:lower()
+                    if n:find("boost") or n:find("energy") or n:find("stamina") or n:find("fuel") then
+                        v.Value = v.Value < (v.MaxValue or 100) - 5
+                            and (v.MaxValue or 100) or v.Value
+                    end
+                end
+            end
+            -- also check leaderstats / PlayerGui bars
+            local stats = LP:FindFirstChild("leaderstats")
+            if stats then
+                for _, v in ipairs(stats:GetChildren()) do
+                    local n = v.Name:lower()
+                    if n:find("boost") or n:find("energy") then
+                        pcall(function() v.Value = 999999 end)
+                    end
+                end
+            end
+        end)
+    end)
+end
+
+-- ================================================================
+-- NO CLIP
+-- ================================================================
+local function startNoClip()
+    if connections.noclip then connections.noclip:Disconnect() end
+    connections.noclip = RunService.Stepped:Connect(function()
+        if not S.noClip then return end
+        pcall(function()
+            local char = getChar(); if not char then return end
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    p.CanCollide = false
+                end
+            end
+        end)
+    end)
+end
+
+local function stopNoClip()
+    if connections.noclip then
+        connections.noclip:Disconnect()
+        connections.noclip = nil
+    end
+    pcall(function()
+        local char = getChar(); if not char then return end
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = true end
+        end
+    end)
+end
+
+-- ================================================================
+-- FLY
+-- ================================================================
+local function startFly()
+    local root = getRoot(); if not root then return end
+    local hum  = getHum()
+    if hum then hum.PlatformStand = true end
+
+    flyBodyVel = Instance.new("BodyVelocity")
+    flyBodyVel.Velocity        = Vector3.zero
+    flyBodyVel.MaxForce        = Vector3.new(1e5,1e5,1e5)
+    flyBodyVel.P               = 1e4
+    flyBodyVel.Parent          = root
+
+    flyBodyGyro = Instance.new("BodyGyro")
+    flyBodyGyro.MaxTorque      = Vector3.new(1e5,1e5,1e5)
+    flyBodyGyro.P              = 1e4
+    flyBodyGyro.CFrame         = root.CFrame
+    flyBodyGyro.Parent         = root
+
+    local SPEED = 60
+    if connections.fly then connections.fly:Disconnect() end
+    connections.fly = RunService.Heartbeat:Connect(function()
+        if not S.fly then return end
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            local mv  = Vector3.zero
+            -- keyboard
+            if UIS:IsKeyDown(Enum.KeyCode.W) then mv = mv + cam.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then mv = mv - cam.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then mv = mv - cam.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then mv = mv + cam.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.Space) or UIS:IsKeyDown(Enum.KeyCode.Q) then
+                mv = mv + Vector3.new(0,1,0)
+            end
+            if UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.E) then
+                mv = mv - Vector3.new(0,1,0)
+            end
+            -- mobile: use camera direction
+            if mv.Magnitude < 0.01 then
+                local moveDir = LP.Character
+                    and LP.Character:FindFirstChildOfClass("Humanoid")
+                    and LP.Character:FindFirstChildOfClass("Humanoid").MoveDirection
+                    or Vector3.zero
+                if moveDir.Magnitude > 0.1 then
+                    mv = cam.CFrame.LookVector * moveDir.Z * -1
+                        + cam.CFrame.RightVector * moveDir.X
+                end
+            end
+
+            if mv.Magnitude > 0 then
+                mv = mv.Unit * SPEED
+            end
+            flyBodyVel.Velocity  = mv
+            flyBodyGyro.CFrame   = workspace.CurrentCamera.CFrame
+        end)
+    end)
+end
+
+local function stopFly()
+    if connections.fly then connections.fly:Disconnect(); connections.fly = nil end
+    pcall(function()
+        if flyBodyVel  then flyBodyVel:Destroy();  flyBodyVel  = nil end
+        if flyBodyGyro then flyBodyGyro:Destroy(); flyBodyGyro = nil end
+        local hum = getHum()
+        if hum then hum.PlatformStand = false end
+    end)
+end
+
+-- ================================================================
+-- ANTI-AFK
+-- ================================================================
+task.spawn(function()
+    while true do
+        task.wait(28)
+        if S.antiAfk then
+            pcall(function()
+                local vu = game:GetService("VirtualUser")
+                vu:CaptureController()
+                vu:ClickButton2(Vector2.new(), workspace.CurrentCamera.CFrame)
+            end)
+        end
+    end
+end)
+
+-- ================================================================
+-- BOOT FARM + BOOST
+-- ================================================================
+startFarm()
+startInfiniteBoost()
+startNoClip()
+
+-- ================================================================
+-- UI HELPERS
+-- ================================================================
+local PINK  = Color3.fromRGB(255, 46, 147)
+local DARK  = Color3.fromRGB(10, 8, 14)
+local DARKM = Color3.fromRGB(18, 12, 26)
+local DARKT = Color3.fromRGB(18, 10, 25)
+local OFF   = Color3.fromRGB(44, 38, 58)
+local WHITE = Color3.new(1,1,1)
+local LGRAY = Color3.fromRGB(180,165,195)
+local DGRAY = Color3.fromRGB(80,65,100)
+
+local function corner(p, r) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 8) end
+local function pad(p,l,r,t,b)
+    local u=Instance.new("UIPadding",p)
+    u.PaddingLeft=UDim.new(0,l or 0); u.PaddingRight=UDim.new(0,r or 0)
+    u.PaddingTop=UDim.new(0,t or 0);  u.PaddingBottom=UDim.new(0,b or 0)
+end
+
+-- ================================================================
+-- SCREEN GUI
+-- ================================================================
+local old = PGui:FindFirstChild("XvEscooterV3")
+if old then old:Destroy() end
+
+local sg = Instance.new("ScreenGui")
+sg.Name           = "XvEscooterV3"
+sg.ResetOnSpawn   = false
+sg.DisplayOrder   = 999
+sg.IgnoreGuiInset = true
+sg.Parent         = PGui
+
+-- ── MAIN WINDOW ──────────────────────────────────────────────────
+local win = Instance.new("Frame")
+win.Name               = "Win"
+win.Size               = UDim2.fromOffset(240, 370)
+win.Position           = UDim2.new(0, 12, 0.5, -185)
+win.BackgroundColor3   = DARK
+win.BorderSizePixel    = 0
+win.Active             = true
+win.Draggable          = true
+win.ClipsDescendants   = true
+win.Parent             = sg
+corner(win, 12)
+local winStroke = Instance.new("UIStroke", win)
+winStroke.Color     = PINK
+winStroke.Thickness = 1.5
+
+-- glow behind stroke
+local glow = Instance.new("ImageLabel", win)
+glow.Size               = UDim2.new(1,20,1,20)
+glow.Position           = UDim2.new(0,-10,0,-10)
+glow.BackgroundTransparency = 1
+glow.Image              = "rbxassetid://5028857472"
+glow.ImageColor3        = PINK
+glow.ImageTransparency  = 0.82
+glow.ZIndex             = 0
+glow.ScaleType          = Enum.ScaleType.Slice
+glow.SliceCenter        = Rect.new(24,24,276,276)
+
+-- ── TOP BAR ──────────────────────────────────────────────────────
+local topBar = Instance.new("Frame", win)
+topBar.Size            = UDim2.new(1,0,0,38)
+topBar.BackgroundColor3= DARKT
+topBar.BorderSizePixel = 0
+topBar.ZIndex          = 2
+
+local logo = Instance.new("TextLabel", topBar)
+logo.Size               = UDim2.new(1,-42,1,0)
+logo.Position           = UDim2.new(0,12,0,0)
+logo.BackgroundTransparency = 1
+logo.Text               = "XV • ESCOOTER LIFE"
+logo.TextColor3         = PINK
+logo.Font               = Enum.Font.GothamBold
+logo.TextSize           = 13
+logo.TextXAlignment     = Enum.TextXAlignment.Left
+logo.ZIndex             = 2
+
+-- minimize btn
+local minBtn = Instance.new("TextButton", topBar)
+minBtn.Size             = UDim2.fromOffset(28, 22)
+minBtn.Position         = UDim2.new(1,-34,0.5,-11)
+minBtn.BackgroundColor3 = Color3.fromRGB(35,18,48)
+minBtn.Text             = "−"
+minBtn.TextColor3       = PINK
+minBtn.Font             = Enum.Font.GothamBold
+minBtn.TextSize         = 15
+minBtn.AutoButtonColor  = false
+minBtn.ZIndex           = 3
+minBtn.Parent           = topBar
+corner(minBtn, 6)
+
+-- accent line
+local accentLine = Instance.new("Frame", win)
+accentLine.Size            = UDim2.new(1,0,0,2)
+accentLine.Position        = UDim2.new(0,0,0,38)
+accentLine.BackgroundColor3= PINK
+accentLine.BorderSizePixel = 0
+accentLine.ZIndex          = 2
+
+-- ── SCROLL CONTENT ───────────────────────────────────────────────
+local scroll = Instance.new("ScrollingFrame", win)
+scroll.Name                   = "Scroll"
+scroll.Size                   = UDim2.new(1,0,1,-42)
+scroll.Position               = UDim2.new(0,0,0,42)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel        = 0
+scroll.ScrollBarThickness     = 3
+scroll.ScrollBarImageColor3   = PINK
+scroll.CanvasSize             = UDim2.fromOffset(0,0)
+scroll.AutomaticCanvasSize    = Enum.AutomaticSize.Y
+
+local layout = Instance.new("UIListLayout", scroll)
+layout.SortOrder  = Enum.SortOrder.LayoutOrder
+layout.Padding    = UDim.new(0,6)
+pad(scroll, 8, 8, 8, 8)
+
+-- ── SECTION LABEL ────────────────────────────────────────────────
+local function sectionLabel(txt, order)
+    local lbl = Instance.new("TextLabel", scroll)
+    lbl.Size               = UDim2.new(1,-16,0,18)
+    lbl.BackgroundTransparency = 1
+    lbl.Text               = txt:upper()
+    lbl.TextColor3         = Color3.fromRGB(120,90,145)
+    lbl.Font               = Enum.Font.GothamBold
+    lbl.TextSize           = 9
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+    lbl.LayoutOrder        = order
+    return lbl
+end
+
+-- ── TOGGLE ROW ───────────────────────────────────────────────────
+local function makeRow(label, sub, order, initState)
+    local bg = Instance.new("Frame", scroll)
+    bg.Size            = UDim2.new(1,-16,0,46)
+    bg.BackgroundColor3= DARKM
+    bg.BorderSizePixel = 0
+    bg.LayoutOrder     = order
+    corner(bg, 10)
+    Instance.new("UIStroke", bg).Color = Color3.fromRGB(35,25,50)
+
+    local lbl = Instance.new("TextLabel", bg)
+    lbl.Size               = UDim2.new(1,-60,0,22)
+    lbl.Position           = UDim2.new(0,12,0,5)
+    lbl.BackgroundTransparency = 1
+    lbl.Text               = label
+    lbl.TextColor3         = WHITE
+    lbl.Font               = Enum.Font.GothamBold
+    lbl.TextSize           = 12
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+
+    local sublbl = Instance.new("TextLabel", bg)
+    sublbl.Size               = UDim2.new(1,-60,0,16)
+    sublbl.Position           = UDim2.new(0,12,0,25)
+    sublbl.BackgroundTransparency = 1
+    sublbl.Text               = sub
+    sublbl.TextColor3         = DGRAY
+    sublbl.Font               = Enum.Font.Gotham
+    sublbl.TextSize           = 9
+    sublbl.TextXAlignment     = Enum.TextXAlignment.Left
+
+    local pill = Instance.new("TextButton", bg)
+    pill.Size             = UDim2.fromOffset(52,26)
+    pill.Position         = UDim2.new(1,-58,0.5,-13)
+    pill.BackgroundColor3 = initState and PINK or OFF
+    pill.Text             = initState and "ON" or "OFF"
+    pill.TextColor3       = WHITE
+    pill.Font             = Enum.Font.GothamBold
+    pill.TextSize         = 10
+    pill.AutoButtonColor  = false
+    corner(pill, 7)
+
+    return bg, pill
+end
+
+-- ── BUTTON ROW (non-toggle) ───────────────────────────────────────
+local function makeBtn(label, sub, order, btnTxt)
+    local bg = Instance.new("Frame", scroll)
+    bg.Size            = UDim2.new(1,-16,0,46)
+    bg.BackgroundColor3= DARKM
+    bg.BorderSizePixel = 0
+    bg.LayoutOrder     = order
+    corner(bg, 10)
+    Instance.new("UIStroke", bg).Color = Color3.fromRGB(35,25,50)
+
+    local lbl = Instance.new("TextLabel", bg)
+    lbl.Size               = UDim2.new(1,-80,0,22)
+    lbl.Position           = UDim2.new(0,12,0,5)
+    lbl.BackgroundTransparency = 1
+    lbl.Text               = label
+    lbl.TextColor3         = WHITE
+    lbl.Font               = Enum.Font.GothamBold
+    lbl.TextSize           = 12
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+
+    local sublbl = Instance.new("TextLabel", bg)
+    sublbl.Size               = UDim2.new(1,-80,0,16)
+    sublbl.Position           = UDim2.new(0,12,0,25)
+    sublbl.BackgroundTransparency = 1
+    sublbl.Text               = sub
+    sublbl.TextColor3         = DGRAY
+    sublbl.Font               = Enum.Font.Gotham
+    sublbl.TextSize           = 9
+    sublbl.TextXAlignment     = Enum.TextXAlignment.Left
+
+    local btn = Instance.new("TextButton", bg)
+    btn.Size             = UDim2.fromOffset(68,26)
+    btn.Position         = UDim2.new(1,-74,0.5,-13)
+    btn.BackgroundColor3 = Color3.fromRGB(35,18,55)
+    btn.Text             = btnTxt or label
+    btn.TextColor3       = PINK
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 10
+    btn.AutoButtonColor  = false
+    corner(btn, 7)
+    Instance.new("UIStroke", btn).Color = PINK
+
+    return bg, btn
+end
+
+-- ── BUILD ROWS ───────────────────────────────────────────────────
+sectionLabel("movement", 1)
+local _, pillWheelie = makeRow("Auto Wheelie",   "lock back-tilt, mobile safe",  2,  false)
+local _, pillFly     = makeRow("Fly Mode",        "float + WASD / joystick",     3,  false)
+local _, pillSpeed   = makeRow("Speed Boost",     "16 → Fast / Turbo / Sonic",   4,  false)
+local speedBg = (function()   -- speed tier selector below speed row
+    local bg = Instance.new("Frame", scroll)
+    bg.Size            = UDim2.new(1,-16,0,32)
+    bg.BackgroundColor3= Color3.fromRGB(14,10,20)
+    bg.BorderSizePixel = 0
+    bg.LayoutOrder     = 5
+    corner(bg, 8)
+
+    local tierBtns = {}
+    for i,lbl in ipairs(SPEED_LABELS) do
+        local b = Instance.new("TextButton", bg)
+        b.Size             = UDim2.fromOffset(60, 22)
+        b.Position         = UDim2.new(0, 8+(i-1)*66, 0.5, -11)
+        b.BackgroundColor3 = i == S.speedTier and PINK or OFF
+        b.Text             = lbl
+        b.TextColor3       = WHITE
+        b.Font             = Enum.Font.GothamBold
+        b.TextSize         = 10
+        b.AutoButtonColor  = false
+        corner(b, 6)
+        tierBtns[i] = b
+
+        b.MouseButton1Click:Connect(function()
+            S.speedTier = i
+            for j,tb in ipairs(tierBtns) do
+                tb.BackgroundColor3 = j==i and PINK or OFF
+            end
+            if S.speed then applySpeed() end
+        end)
+    end
+    return bg
+end)()
+
+local _, pillNoClip  = makeRow("No Clip",         "phase through everything",    6,  false)
+
+sectionLabel("farming", 10)
+local _, pillFarm    = makeRow("Auto Farm",       "collect coins + gems nearby",  11, false)
+local _, pillBoost   = makeRow("Infinite Boost",  "keeps boost bar full",         12, false)
+
+sectionLabel("utility", 20)
+local _, pillAfk     = makeRow("Anti-AFK",        "silent jiggle, no kick",       21, true)
+local _, btnTele     = makeBtn("Teleport Spawn",  "back to spawn point",          22, "GO")
+local _, btnReset    = makeBtn("Reset Character", "respawn instantly",            23, "RESET")
+
+-- credit
+local cred = Instance.new("TextLabel", scroll)
+cred.Size               = UDim2.new(1,-16,0,20)
+cred.BackgroundTransparency = 1
+cred.Text               = "XV TOOLS  •  v3"
+cred.TextColor3         = Color3.fromRGB(55,40,75)
+cred.Font               = Enum.Font.GothamBold
+cred.TextSize           = 9
+cred.LayoutOrder        = 99
+
+-- ================================================================
+-- WIRE UP BUTTONS
+-- ================================================================
+
+-- wheelie
+pillWheelie.MouseButton1Click:Connect(function()
+    S.wheelie = not S.wheelie
+    pillWheelie.BackgroundColor3 = S.wheelie and PINK or OFF
+    pillWheelie.Text = S.wheelie and "ON" or "OFF"
+    if S.wheelie then startWheelie() else stopWheelie() end
+end)
+
+-- fly
+pillFly.MouseButton1Click:Connect(function()
+    S.fly = not S.fly
+    pillFly.BackgroundColor3 = S.fly and PINK or OFF
+    pillFly.Text = S.fly and "ON" or "OFF"
+    if S.fly then startFly() else stopFly() end
+end)
+
+-- speed
+pillSpeed.MouseButton1Click:Connect(function()
+    S.speed = not S.speed
+    pillSpeed.BackgroundColor3 = S.speed and PINK or OFF
+    pillSpeed.Text = S.speed and "ON" or "OFF"
+    applySpeed()
+end)
+
+-- no clip
+pillNoClip.MouseButton1Click:Connect(function()
+    S.noClip = not S.noClip
+    pillNoClip.BackgroundColor3 = S.noClip and PINK or OFF
+    pillNoClip.Text = S.noClip and "ON" or "OFF"
+    if S.noClip then startNoClip() else stopNoClip() end
+end)
+
+-- farm
+pillFarm.MouseButton1Click:Connect(function()
+    S.farm = not S.farm
+    pillFarm.BackgroundColor3 = S.farm and PINK or OFF
+    pillFarm.Text = S.farm and "ON" or "OFF"
+end)
+
+-- infinite boost
+pillBoost.MouseButton1Click:Connect(function()
+    S.infiniteBoost = not S.infiniteBoost
+    pillBoost.BackgroundColor3 = S.infiniteBoost and PINK or OFF
+    pillBoost.Text = S.infiniteBoost and "ON" or "OFF"
+end)
+
+-- anti-afk
+pillAfk.MouseButton1Click:Connect(function()
+    S.antiAfk = not S.antiAfk
+    pillAfk.BackgroundColor3 = S.antiAfk and PINK or OFF
+    pillAfk.Text = S.antiAfk and "ON" or "OFF"
+end)
+
+-- teleport spawn
+btnTele.MouseButton1Click:Connect(function()
+    pcall(function()
+        local root = getRoot(); if not root then return end
+        local spawn = workspace:FindFirstChild("SpawnLocation")
+            or workspace:FindFirstChildWhichIsA("SpawnLocation")
+        if spawn then
+            root.CFrame = spawn.CFrame + Vector3.new(0,5,0)
+        else
+            root.CFrame = CFrame.new(0,5,0)
+        end
+    end)
+end)
+
+-- reset
+btnReset.MouseButton1Click:Connect(function()
+    pcall(function()
+        LP.Character:FindFirstChildOfClass("Humanoid").Health = 0
+    end)
+end)
+
+-- ================================================================
+-- MINIMIZE
+-- ================================================================
+local minimized  = false
+local FULL_SIZE  = UDim2.fromOffset(240, 370)
+local MINI_SIZE  = UDim2.fromOffset(240, 38)
+
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    scroll.Visible   = not minimized
+    accentLine.Visible = not minimized
+    win.Size         = minimized and MINI_SIZE or FULL_SIZE
+    minBtn.Text      = minimized and "+" or "−"
+    winStroke.Color  = minimized and Color3.fromRGB(80,60,100) or PINK
+end)
+
+-- ================================================================
+print("[XV] Escooter Life v3 loaded")
+-- ================================================================
