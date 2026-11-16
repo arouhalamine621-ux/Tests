@@ -1,0 +1,663 @@
+-- ================================================================
+--   XV • ESCOOTER LIFE  v4
+--   by XV Tools
+-- ================================================================
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+-- VirtualInputManager removed — not needed and errors on some executors
+local LP         = Players.LocalPlayer
+local PGui       = LP:WaitForChild("PlayerGui")
+
+local function getChar() return LP.Character end
+local function getRoot() return getChar() and getChar():FindFirstChild("HumanoidRootPart") end
+local function getHum()  return getChar() and getChar():FindFirstChildOfClass("Humanoid") end
+
+local function getVehicle()
+    local char = getChar(); if not char then return nil, nil end
+    local hum  = getHum();  if not hum  then return nil, nil end
+    local seat = hum.SeatPart
+    if seat and (seat:IsA("VehicleSeat") or seat:IsA("Seat")) then
+        return seat, seat.Parent
+    end
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("VehicleSeat") and obj.Occupant == hum then
+            return obj, obj.Parent
+        end
+    end
+    return nil, nil
+end
+
+-- ================================================================
+-- STATE
+-- ================================================================
+local S = {
+    wheelie       = false,
+    farm          = false,
+    speed         = false,
+    speedTier     = 1,
+    infiniteBoost = false,
+    noClip        = false,
+    fly           = false,
+    antiAfk       = true,
+    wheelieAngle  = 52,
+}
+
+local SPEED_TIERS  = {60, 120, 220}
+local SPEED_LABELS = {"Fast","Turbo","Sonic"}
+local conns        = {}
+local flyBV, flyBG = nil, nil
+local farmWaypoints= {}
+local farmIdx      = 1
+
+-- ================================================================
+-- WHEELIE — fires accelerate + holds tilt + balances
+-- ================================================================
+local wheelieGyro = nil
+
+local function startWheelie()
+    if conns.wheelie then conns.wheelie:Disconnect() end
+
+    conns.wheelie = RunService.Heartbeat:Connect(function()
+        pcall(function()
+            local seat, vehicle = getVehicle()
+
+            -- ── VEHICLE SEAT MODE ─────────────────────────────
+            if seat and seat:IsA("VehicleSeat") then
+                -- hold throttle at max
+                seat.ThrottleFloat = 1
+
+                -- tilt the whole vehicle model back
+                local model = vehicle or seat
+                local primary = model:IsA("Model") and model.PrimaryPart or seat
+                if primary then
+                    local _, yaw, _ = primary.CFrame:ToEulerAnglesYXZ()
+                    -- smooth lerp toward target angle
+                    local target = CFrame.new(primary.Position)
+                        * CFrame.fromEulerAnglesYXZ(math.rad(-S.wheelieAngle), yaw, 0)
+                    primary.CFrame = primary.CFrame:Lerp(target, 0.18)
+                end
+
+                -- keep front wheel off ground via BodyGyro on seat
+                if not wheelieGyro or not wheelieGyro.Parent then
+                    wheelieGyro = Instance.new("BodyGyro")
+                    wheelieGyro.MaxTorque = Vector3.new(1e6, 0, 1e6)
+                    wheelieGyro.P         = 8000
+                    wheelieGyro.D         = 500
+                    wheelieGyro.Parent    = seat
+                end
+                local _, yaw2, _ = seat.CFrame:ToEulerAnglesYXZ()
+                wheelieGyro.CFrame = CFrame.fromEulerAnglesYXZ(
+                    math.rad(-S.wheelieAngle), yaw2, 0
+                )
+
+                -- fire wheelie remotes if any exist
+                pcall(function()
+                    local rs = game:GetService("ReplicatedStorage")
+                    for _, re in ipairs(rs:GetDescendants()) do
+                        if re:IsA("RemoteEvent") then
+                            local n = re.Name:lower()
+                            if n:find("wheelie") or n:find("trick") or n:find("stunt") then
+                                re:FireServer("wheelie", true)
+                            end
+                        end
+                    end
+                end)
+                return
+            end
+
+            -- ── HRP FALLBACK (on foot / unknown vehicle) ──────
+            local root = getRoot(); if not root then return end
+            local _, yaw, _ = root.CFrame:ToEulerAnglesYXZ()
+            root.CFrame = root.CFrame:Lerp(
+                CFrame.new(root.Position)
+                    * CFrame.fromEulerAnglesYXZ(math.rad(-S.wheelieAngle), yaw, 0),
+                0.18
+            )
+        end)
+    end)
+end
+
+local function stopWheelie()
+    if conns.wheelie then conns.wheelie:Disconnect(); conns.wheelie = nil end
+    pcall(function()
+        if wheelieGyro then wheelieGyro:Destroy(); wheelieGyro = nil end
+        local seat = getVehicle()
+        if seat then
+            seat.ThrottleFloat = 0
+            local _, yaw, _ = seat.CFrame:ToEulerAnglesYXZ()
+            seat.CFrame = CFrame.new(seat.Position)
+                * CFrame.fromEulerAnglesYXZ(0, yaw, 0)
+        end
+    end)
+end
+
+-- ================================================================
+-- FARM — moves to collectibles + collectibles at full speed
+-- ================================================================
+local KEYWORDS = {
+    "coin","cash","money","xp","gem","token","reward",
+    "star","pickup","collectible","note","bill","drop","credit"
+}
+local function nameHit(n)
+    n = n:lower()
+    for _, k in ipairs(KEYWORDS) do if n:find(k) then return true end end
+    return false
+end
+
+local function buildWaypoints()
+    local list = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if nameHit(obj.Name) then
+            local part = obj:IsA("BasePart") and obj
+                or obj:FindFirstChildWhichIsA("BasePart")
+            if part then table.insert(list, part) end
+        end
+    end
+    -- also grab all checkpoints
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local n = obj.Name:lower()
+            if n:find("checkpoint") or n:find("waypoint") then
+                table.insert(list, obj)
+            end
+        end
+    end
+    return list
+end
+
+local function collectAt(part)
+    pcall(function()
+        local cd = part:FindFirstChildOfClass("ClickDetector")
+            or part.Parent:FindFirstChildOfClass("ClickDetector")
+        if cd then fireclickdetector(cd) end
+    end)
+    pcall(function()
+        local pp = part:FindFirstChildOfClass("ProximityPrompt")
+            or part.Parent:FindFirstChildOfClass("ProximityPrompt")
+        if pp then fireproximityprompt(pp) end
+    end)
+    pcall(function()
+        local root = getRoot(); if not root then return end
+        if part:FindFirstChildOfClass("TouchTransmitter")
+        or part.Parent:FindFirstChildOfClass("TouchTransmitter") then
+            local orig = root.CFrame
+            root.CFrame = part.CFrame + Vector3.new(0,3,0)
+            task.delay(0.05, function() pcall(function() root.CFrame = orig end) end)
+        end
+    end)
+    -- fire any collect remotes
+    pcall(function()
+        local rs = game:GetService("ReplicatedStorage")
+        for _, re in ipairs(rs:GetDescendants()) do
+            if re:IsA("RemoteEvent") then
+                local n = re.Name:lower()
+                if n:find("collect") or n:find("coin") or n:find("pickup") or n:find("cash") then
+                    re:FireServer(part)
+                end
+            end
+        end
+    end)
+end
+
+-- farmMoveConn removed — farm uses conns.farm only
+
+local function driveTo(targetPos)
+    -- steer scooter OR walk toward position
+    pcall(function()
+        local root = getRoot(); if not root then return end
+        local hum  = getHum();  if not hum  then return end
+        local seat, vehicle = getVehicle()
+
+        if seat and seat:IsA("VehicleSeat") then
+            -- on scooter: set throttle + steer
+            seat.ThrottleFloat = 1
+
+            -- calculate angle between scooter facing and target
+            local toTarget = (targetPos - root.Position) * Vector3.new(1,0,1)
+            if toTarget.Magnitude < 0.1 then return end
+            toTarget = toTarget.Unit
+
+            local facing = root.CFrame.LookVector * Vector3.new(1,0,1)
+            if facing.Magnitude < 0.1 then return end
+            facing = facing.Unit
+
+            local cross = facing:Cross(toTarget)
+            local dot   = facing:Dot(toTarget)
+            local steer = cross.Y > 0 and 1 or -1
+            if math.abs(cross.Y) < 0.1 and dot > 0 then steer = 0 end
+
+            seat.SteerFloat = steer
+        else
+            -- on foot: just walk
+            hum.WalkSpeed = 220
+            hum:MoveTo(targetPos)
+        end
+    end)
+end
+
+local function startFarm()
+    if conns.farm then
+        pcall(task.cancel, conns.farm)
+        conns.farm = nil
+    end
+
+    farmWaypoints = buildWaypoints()
+    -- if no collectibles found, build a grid of map waypoints to patrol
+    if #farmWaypoints < 3 then
+        for x = -300, 300, 80 do
+            for z = -300, 300, 80 do
+                table.insert(farmWaypoints, {Position = Vector3.new(x, 0, z), Parent = workspace})
+            end
+        end
+    end
+    farmIdx = 1
+
+    -- move loop — runs every 0.15s, mobile safe
+    conns.farm = task.spawn(function()
+        while S.farm do
+            local ok, err = pcall(function()
+                local root = getRoot(); if not root then return end
+
+                if #farmWaypoints == 0 then
+                    farmWaypoints = buildWaypoints()
+                    return
+                end
+
+                -- skip destroyed parts
+                local attempts = 0
+                while attempts < #farmWaypoints do
+                    local target = farmWaypoints[farmIdx]
+                    if target and target.Parent then break end
+                    farmIdx = (farmIdx % #farmWaypoints) + 1
+                    attempts = attempts + 1
+                end
+
+                local target = farmWaypoints[farmIdx]
+                if not target or not target.Parent then return end
+
+                local targetPos = Vector3.new(target.Position.X, target.Position.Y + 3, target.Position.Z)
+                local dist = (targetPos - root.Position).Magnitude
+
+                if dist < 12 then
+                    collectAt(target)
+                    farmIdx = (farmIdx % #farmWaypoints) + 1
+                else
+                    driveTo(targetPos)
+                end
+            end)
+            if not ok then
+                warn("[XV Farm] "..tostring(err))
+            end
+            task.wait(0.15)
+        end
+    end)
+end
+
+local function stopFarm()
+    S.farm = false
+    if conns.farm then
+        pcall(task.cancel, conns.farm)
+        conns.farm = nil
+    end
+    pcall(function()
+        local seat = getVehicle()
+        if seat then seat.ThrottleFloat = 0; seat.SteerFloat = 0 end
+        local hum = getHum()
+        if hum then hum.WalkSpeed = S.speed and SPEED_TIERS[S.speedTier] or 16 end
+    end)
+end
+
+-- ================================================================
+-- SPEED
+-- ================================================================
+local function applySpeed()
+    pcall(function()
+        local hum = getHum(); if not hum then return end
+        hum.WalkSpeed = S.speed and SPEED_TIERS[S.speedTier] or 16
+        hum.JumpPower = S.speed and 80 or 50
+    end)
+end
+LP.CharacterAdded:Connect(function() task.delay(1, applySpeed) end)
+
+-- ================================================================
+-- INFINITE BOOST
+-- ================================================================
+local function startBoost()
+    if conns.boost then conns.boost:Disconnect() end
+    conns.boost = RunService.Heartbeat:Connect(function()
+        if not S.infiniteBoost then return end
+        pcall(function()
+            local char = getChar(); if not char then return end
+            for _, v in ipairs(char:GetDescendants()) do
+                if (v:IsA("NumberValue") or v:IsA("IntValue")) then
+                    local n = v.Name:lower()
+                    if n:find("boost") or n:find("energy") or n:find("stamina") or n:find("fuel") then
+                        v.Value = v.MaxValue or 100
+                    end
+                end
+            end
+            -- vehicle seat boost
+            local seat = getVehicle()
+            if seat then seat.ThrottleFloat = 1 end
+        end)
+    end)
+end
+
+-- ================================================================
+-- NO CLIP
+-- ================================================================
+local function startNoClip()
+    if conns.noclip then conns.noclip:Disconnect() end
+    conns.noclip = RunService.Stepped:Connect(function()
+        if not S.noClip then return end
+        pcall(function()
+            local char = getChar(); if not char then return end
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = false end
+            end
+        end)
+    end)
+end
+
+-- ================================================================
+-- FLY
+-- ================================================================
+local function startFly()
+    local root = getRoot(); if not root then return end
+    local hum  = getHum()
+    if hum then hum.PlatformStand = true end
+
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.Velocity  = Vector3.zero
+    flyBV.MaxForce  = Vector3.new(1e5,1e5,1e5)
+    flyBV.P         = 1e4
+    flyBV.Parent    = root
+
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(1e5,1e5,1e5)
+    flyBG.P         = 1e4
+    flyBG.CFrame    = root.CFrame
+    flyBG.Parent    = root
+
+    if conns.fly then conns.fly:Disconnect() end
+    conns.fly = RunService.Heartbeat:Connect(function()
+        if not S.fly then return end
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            local mv  = Vector3.zero
+            if UIS:IsKeyDown(Enum.KeyCode.W) then mv = mv + cam.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then mv = mv - cam.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then mv = mv - cam.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then mv = mv + cam.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.Space) then mv = mv + Vector3.new(0,1,0) end
+            if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then mv = mv - Vector3.new(0,1,0) end
+            -- mobile joystick
+            local mdir = getHum() and getHum().MoveDirection or Vector3.zero
+            if mv.Magnitude < 0.01 and mdir.Magnitude > 0.1 then
+                mv = cam.CFrame.LookVector*(-mdir.Z) + cam.CFrame.RightVector*mdir.X
+            end
+            flyBV.Velocity = mv.Magnitude > 0 and mv.Unit*80 or Vector3.zero
+            flyBG.CFrame   = cam.CFrame
+        end)
+    end)
+end
+
+local function stopFly()
+    if conns.fly then conns.fly:Disconnect(); conns.fly = nil end
+    pcall(function()
+        if flyBV  then flyBV:Destroy();  flyBV  = nil end
+        if flyBG  then flyBG:Destroy(); flyBG  = nil end
+        local hum = getHum()
+        if hum then hum.PlatformStand = false end
+    end)
+end
+
+-- ================================================================
+-- ANTI-AFK
+-- ================================================================
+task.spawn(function()
+    while true do
+        task.wait(28)
+        if S.antiAfk then
+            pcall(function()
+                local vu = game:GetService("VirtualUser")
+                vu:CaptureController()
+                vu:ClickButton2(Vector2.new(), workspace.CurrentCamera.CFrame)
+            end)
+        end
+    end
+end)
+
+-- ================================================================
+-- START BACKGROUND LOOPS
+-- ================================================================
+startBoost()
+startNoClip()
+
+-- ================================================================
+-- UI
+-- ================================================================
+local PINK  = Color3.fromRGB(255, 46, 147)
+local DARK  = Color3.fromRGB(10, 8, 14)
+local DARKM = Color3.fromRGB(18, 12, 26)
+local DARKT = Color3.fromRGB(18, 10, 25)
+local OFF   = Color3.fromRGB(44, 38, 58)
+local WHITE = Color3.new(1,1,1)
+local DGRAY = Color3.fromRGB(80,65,100)
+
+local function corner(p,r) Instance.new("UICorner",p).CornerRadius=UDim.new(0,r or 8) end
+local function pad(p,l,r,t,b)
+    local u=Instance.new("UIPadding",p)
+    u.PaddingLeft=UDim.new(0,l or 0); u.PaddingRight=UDim.new(0,r or 0)
+    u.PaddingTop=UDim.new(0,t or 0);  u.PaddingBottom=UDim.new(0,b or 0)
+end
+
+local old = PGui:FindFirstChild("XvEscooterV4")
+if old then old:Destroy() end
+
+local sg = Instance.new("ScreenGui")
+sg.Name="XvEscooterV4"; sg.ResetOnSpawn=false
+sg.DisplayOrder=999; sg.IgnoreGuiInset=true; sg.Parent=PGui
+
+-- window
+local win = Instance.new("Frame", sg)
+win.Name="Win"; win.Size=UDim2.fromOffset(240,380)
+win.Position=UDim2.new(0,12,0.5,-190)
+win.BackgroundColor3=DARK; win.BorderSizePixel=0
+win.Active=true; win.Draggable=true; win.ClipsDescendants=true
+corner(win,12)
+local ws=Instance.new("UIStroke",win); ws.Color=PINK; ws.Thickness=1.5
+
+-- glow
+local glow=Instance.new("ImageLabel",win)
+glow.Size=UDim2.new(1,20,1,20); glow.Position=UDim2.new(0,-10,0,-10)
+glow.BackgroundTransparency=1; glow.Image="rbxassetid://5028857472"
+glow.ImageColor3=PINK; glow.ImageTransparency=0.82; glow.ZIndex=0
+glow.ScaleType=Enum.ScaleType.Slice; glow.SliceCenter=Rect.new(24,24,276,276)
+
+-- topbar
+local top=Instance.new("Frame",win)
+top.Size=UDim2.new(1,0,0,38); top.BackgroundColor3=DARKT; top.BorderSizePixel=0; top.ZIndex=2
+
+local titleLbl=Instance.new("TextLabel",top)
+titleLbl.Size=UDim2.new(1,-42,1,0); titleLbl.Position=UDim2.new(0,12,0,0)
+titleLbl.BackgroundTransparency=1; titleLbl.Text="XV • ESCOOTER LIFE v4"
+titleLbl.TextColor3=PINK; titleLbl.Font=Enum.Font.GothamBold; titleLbl.TextSize=12; titleLbl.ZIndex=2
+titleLbl.TextXAlignment=Enum.TextXAlignment.Left
+
+local minBtn=Instance.new("TextButton",top)
+minBtn.Size=UDim2.fromOffset(28,22); minBtn.Position=UDim2.new(1,-34,0.5,-11)
+minBtn.BackgroundColor3=Color3.fromRGB(35,18,48); minBtn.Text="−"
+minBtn.TextColor3=PINK; minBtn.Font=Enum.Font.GothamBold; minBtn.TextSize=15
+minBtn.AutoButtonColor=false; minBtn.ZIndex=3
+corner(minBtn,6)
+
+local accentLine=Instance.new("Frame",win)
+accentLine.Size=UDim2.new(1,0,0,2); accentLine.Position=UDim2.new(0,0,0,38)
+accentLine.BackgroundColor3=PINK; accentLine.BorderSizePixel=0; accentLine.ZIndex=2
+
+-- scroll
+local scroll=Instance.new("ScrollingFrame",win)
+scroll.Name="Scroll"; scroll.Size=UDim2.new(1,0,1,-42); scroll.Position=UDim2.new(0,0,0,42)
+scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0
+scroll.ScrollBarThickness=3; scroll.ScrollBarImageColor3=PINK
+scroll.CanvasSize=UDim2.fromOffset(0,0); scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
+local lay=Instance.new("UIListLayout",scroll); lay.SortOrder=Enum.SortOrder.LayoutOrder; lay.Padding=UDim.new(0,5)
+pad(scroll,8,8,6,8)
+
+-- section header
+local function sec(txt,order)
+    local l=Instance.new("TextLabel",scroll); l.LayoutOrder=order
+    l.Size=UDim2.new(1,-16,0,16); l.BackgroundTransparency=1
+    l.Text=txt:upper(); l.TextColor3=Color3.fromRGB(110,80,140)
+    l.Font=Enum.Font.GothamBold; l.TextSize=9; l.TextXAlignment=Enum.TextXAlignment.Left
+end
+
+-- toggle row
+local function row(label,sub,order,init)
+    local bg=Instance.new("Frame",scroll)
+    bg.Size=UDim2.new(1,-16,0,50); bg.BackgroundColor3=DARKM
+    bg.BorderSizePixel=0; bg.LayoutOrder=order
+    corner(bg,10); Instance.new("UIStroke",bg).Color=Color3.fromRGB(32,22,48)
+
+    local l=Instance.new("TextLabel",bg)
+    l.Size=UDim2.new(1,-62,0,24); l.Position=UDim2.new(0,12,0,5)
+    l.BackgroundTransparency=1; l.Text=label; l.TextColor3=WHITE
+    l.Font=Enum.Font.GothamBold; l.TextSize=12; l.TextXAlignment=Enum.TextXAlignment.Left
+
+    local sl=Instance.new("TextLabel",bg)
+    sl.Size=UDim2.new(1,-62,0,16); sl.Position=UDim2.new(0,12,0,28)
+    sl.BackgroundTransparency=1; sl.Text=sub; sl.TextColor3=DGRAY
+    sl.Font=Enum.Font.Gotham; sl.TextSize=9; sl.TextXAlignment=Enum.TextXAlignment.Left
+
+    local pill=Instance.new("TextButton",bg)
+    pill.Size=UDim2.fromOffset(52,26); pill.Position=UDim2.new(1,-58,0.5,-13)
+    pill.BackgroundColor3=init and PINK or OFF; pill.Text=init and "ON" or "OFF"
+    pill.TextColor3=WHITE; pill.Font=Enum.Font.GothamBold; pill.TextSize=10
+    pill.AutoButtonColor=false; corner(pill,7)
+    return pill
+end
+
+-- action button
+local function actionBtn(label,sub,order,btnTxt)
+    local bg=Instance.new("Frame",scroll)
+    bg.Size=UDim2.new(1,-16,0,50); bg.BackgroundColor3=DARKM
+    bg.BorderSizePixel=0; bg.LayoutOrder=order
+    corner(bg,10); Instance.new("UIStroke",bg).Color=Color3.fromRGB(32,22,48)
+
+    local l=Instance.new("TextLabel",bg)
+    l.Size=UDim2.new(1,-80,0,24); l.Position=UDim2.new(0,12,0,5)
+    l.BackgroundTransparency=1; l.Text=label; l.TextColor3=WHITE
+    l.Font=Enum.Font.GothamBold; l.TextSize=12; l.TextXAlignment=Enum.TextXAlignment.Left
+
+    local sl=Instance.new("TextLabel",bg)
+    sl.Size=UDim2.new(1,-80,0,16); sl.Position=UDim2.new(0,12,0,28)
+    sl.BackgroundTransparency=1; sl.Text=sub; sl.TextColor3=DGRAY
+    sl.Font=Enum.Font.Gotham; sl.TextSize=9; sl.TextXAlignment=Enum.TextXAlignment.Left
+
+    local btn=Instance.new("TextButton",bg)
+    btn.Size=UDim2.fromOffset(66,26); btn.Position=UDim2.new(1,-72,0.5,-13)
+    btn.BackgroundColor3=Color3.fromRGB(35,18,55); btn.Text=btnTxt or label
+    btn.TextColor3=PINK; btn.Font=Enum.Font.GothamBold; btn.TextSize=10
+    btn.AutoButtonColor=false; corner(btn,7)
+    Instance.new("UIStroke",btn).Color=PINK
+    return btn
+end
+
+-- ── BUILD UI ─────────────────────────────────────────────────────
+sec("scooter tricks",1)
+local pWheelie = row("🛴  Auto Wheelie",  "accelerate + tilt + balance",  2, false)
+local pFly     = row("✈️  Fly Mode",       "float + joystick / WASD",      3, false)
+
+sec("speed",10)
+local pSpeed   = row("⚡  Speed Boost",   "16 → Fast / Turbo / Sonic",    11, false)
+
+-- tier selector
+local tierFrame=Instance.new("Frame",scroll)
+tierFrame.Size=UDim2.new(1,-16,0,30); tierFrame.BackgroundColor3=Color3.fromRGB(14,10,20)
+tierFrame.BorderSizePixel=0; tierFrame.LayoutOrder=12
+corner(tierFrame,8)
+local tierBtns={}
+for i,lbl in ipairs(SPEED_LABELS) do
+    local b=Instance.new("TextButton",tierFrame)
+    b.Size=UDim2.fromOffset(60,22); b.Position=UDim2.new(0,6+(i-1)*66,0.5,-11)
+    b.BackgroundColor3=i==S.speedTier and PINK or OFF; b.Text=lbl
+    b.TextColor3=WHITE; b.Font=Enum.Font.GothamBold; b.TextSize=10
+    b.AutoButtonColor=false; corner(b,6); tierBtns[i]=b
+    b.MouseButton1Click:Connect(function()
+        S.speedTier=i
+        for j,tb in ipairs(tierBtns) do tb.BackgroundColor3=j==i and PINK or OFF end
+        if S.speed then applySpeed() end
+    end)
+end
+
+sec("farming",20)
+local pFarm    = row("💰  Auto Farm",     "move + collect everything",    21, false)
+local pBoost   = row("🔋  Infinite Boost","fills boost bar always",        22, false)
+local pNoClip  = row("👻  No Clip",       "phase through walls",          23, false)
+
+sec("utility",30)
+local pAfk     = row("🛡️  Anti-AFK",      "silent jiggle loop",           31, true)
+local bSpawn   = actionBtn("Teleport Spawn","go back to spawn",            32,"GO")
+local bReset   = actionBtn("Reset Char",    "respawn instantly",           33,"RESET")
+
+local cred=Instance.new("TextLabel",scroll)
+cred.Size=UDim2.new(1,-16,0,20); cred.BackgroundTransparency=1
+cred.Text="XV TOOLS  •  v4"; cred.TextColor3=Color3.fromRGB(50,35,70)
+cred.Font=Enum.Font.GothamBold; cred.TextSize=9; cred.LayoutOrder=99
+
+-- ── WIRE ─────────────────────────────────────────────────────────
+local function wire(pill,key,onF,offF)
+    pill.MouseButton1Click:Connect(function()
+        S[key]=not S[key]
+        pill.BackgroundColor3=S[key] and PINK or OFF
+        pill.Text=S[key] and "ON" or "OFF"
+        if S[key] then pcall(onF) else pcall(offF) end
+    end)
+end
+
+wire(pWheelie,"wheelie", startWheelie, stopWheelie)
+wire(pFly,    "fly",     startFly,     stopFly)
+wire(pSpeed,  "speed",   applySpeed,   applySpeed)
+wire(pFarm,   "farm",
+    function() S.farm=true;  startFarm() end,
+    function() stopFarm() end)
+wire(pBoost,  "infiniteBoost", function() end, function() end)
+wire(pNoClip, "noClip",
+    function() startNoClip() end,
+    function()
+        if conns.noclip then conns.noclip:Disconnect(); conns.noclip=nil end
+        pcall(function()
+            local char=getChar(); if not char then return end
+            for _,p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide=true end
+            end
+        end)
+    end)
+wire(pAfk,"antiAfk",function()end,function()end)
+
+bSpawn.MouseButton1Click:Connect(function()
+    pcall(function()
+        local root=getRoot(); if not root then return end
+        local sp=workspace:FindFirstChildWhichIsA("SpawnLocation",true)
+        root.CFrame=sp and (sp.CFrame+Vector3.new(0,5,0)) or CFrame.new(0,5,0)
+    end)
+end)
+bReset.MouseButton1Click:Connect(function()
+    pcall(function() getHum().Health=0 end)
+end)
+
+-- ── MINIMIZE ──────────────────────────────────────────────────────
+local minimized=false
+minBtn.MouseButton1Click:Connect(function()
+    minimized=not minimized
+    scroll.Visible=not minimized
+    accentLine.Visible=not minimized
+    win.Size=minimized and UDim2.fromOffset(240,38) or UDim2.fromOffset(240,380)
+    minBtn.Text=minimized and "+" or "−"
+    ws.Color=minimized and Color3.fromRGB(80,60,100) or PINK
+end)
+
+print("[XV] Escooter Life v4 loaded")
